@@ -34,12 +34,17 @@
 
 #define LWS_DLL
 #define LWS_INTERNAL
-#include "../lib/libwebsockets.h"
+#include <libwebsockets.h>
+
 #include <string.h>
 #include <stdlib.h>
 #include <dirent.h>
 #include <errno.h>
+#include <unistd.h>
+#include <fcntl.h>
 
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <sys/stat.h>
 
 struct req {
@@ -133,7 +138,7 @@ mention(struct lws_protocols *pcol, struct lws_vhost *vh, const char *path)
 		return MENTION_FAILED;
 	memset(req, 0, sizeof(*req));
 
-	lws_snprintf(req->filepath, 128, "%s", vhd->cache_dir);
+	strcpy(req->filepath, vhd->cache_dir);
 	if (req->filepath[strlen(req->filepath) - 1] != '/')
 		strcat(req->filepath, "/");
 	if (path_to_cache_filename(path, req->filepath + strlen(req->filepath),
@@ -181,7 +186,7 @@ mention(struct lws_protocols *pcol, struct lws_vhost *vh, const char *path)
 	if (lws_parse_uri(tmp, &prot, &i.address, &i.port, &opath)) {
 		lwsl_notice("%s: parse uri %s: failed\n", __func__, tmp);
 		free(tmp);
-		return MENTION_FAILED;
+		goto bail1;
 	}
 	if (!strcmp(prot, "https"))
 		i.ssl_connection |= LCCSCF_USE_SSL;
@@ -194,6 +199,10 @@ mention(struct lws_protocols *pcol, struct lws_vhost *vh, const char *path)
 	i.vhost = vh;
 	i.alpn = "http/1.1";
 
+	 /*
+	  * the req is bound to the client fetch request and becomes responsible
+	  * to free it if the client connect initial part below succeeds
+	  */
 	i.userdata = req;
 
 	lws_dll_add_front(&req->next, &vhd->head);
@@ -203,6 +212,7 @@ mention(struct lws_protocols *pcol, struct lws_vhost *vh, const char *path)
 		lwsl_notice("%s: requested %s %s:%d %s\n", __func__, prot,
 				i.address, i.port, path);
 		free(tmp);
+		/* req is now the responsibility of the client wsi */
 
 		return MENTION_REQUESTED;
 	}
@@ -245,6 +255,7 @@ callback_hproxy(struct lws *wsi, enum lws_callback_reasons reason,
 			      lws_protocol_vh_priv_get(lws_get_vhost(wsi),
 						       lws_get_protocol(wsi));
 	struct req *req = NULL;
+	int uid, gid;
 
 	switch (reason) {
 
@@ -262,6 +273,18 @@ callback_hproxy(struct lws *wsi, enum lws_callback_reasons reason,
 			return -1;
 		if (get_pvo(in, "cache-dir", &vhd->cache_dir))
 			return -1;
+
+		/*
+		 * Make sure the cache dir exists with the correct user.
+		 *
+		 * Uniquely this callback happens before we drop our initial
+		 * root privileges.  So we can solve otherwise thorny issues
+		 * like create necessary dirs with correct user.
+		 */
+
+		lws_get_effective_uid_gid(lws_get_context(wsi), &uid, &gid);
+		(void)mkdir(vhd->cache_dir, 0700);
+		(void)chown(vhd->cache_dir, uid, gid);
 
 		vhd->context = lws_get_context(wsi);
 
@@ -282,11 +305,11 @@ callback_hproxy(struct lws *wsi, enum lws_callback_reasons reason,
 	/* --------------- http client --------------- */
 
 	case LWS_CALLBACK_ESTABLISHED_CLIENT_HTTP:
-		lwsl_user("LWS_CALLBACK_ESTABLISHED_CLIENT_HTTP %p\n", wsi);
+		lwsl_notice("LWS_CALLBACK_ESTABLISHED_CLIENT_HTTP %p\n", wsi);
 		return 0;
 
 	case LWS_CALLBACK_CLIENT_CONNECTION_ERROR:
-		lwsl_err("CLIENT_CONNECTION_ERROR: %s\n",
+		lwsl_notice("CLIENT_CONNECTION_ERROR: %p: %s\n", wsi,
 				in ? (char *)in : "(null)");
 		req = (struct req *)user;
 		unlink(req->filepath);
@@ -294,7 +317,7 @@ callback_hproxy(struct lws *wsi, enum lws_callback_reasons reason,
 
 	/* chunks of chunked content, with header removed */
 	case LWS_CALLBACK_RECEIVE_CLIENT_HTTP_READ:
-		lwsl_user("RECEIVE_CLIENT_HTTP_READ: read %d\n", (int)len);
+		lwsl_debug("RECEIVE_CLIENT_HTTP_READ: read %d\n", (int)len);
 		req = (struct req *)user;
 		if (write(req->fd, in, len) != (ssize_t)len)
 			goto nope;
@@ -314,11 +337,11 @@ callback_hproxy(struct lws *wsi, enum lws_callback_reasons reason,
 		return 0; /* don't passthru */
 
 	case LWS_CALLBACK_COMPLETED_CLIENT_HTTP:
-		lwsl_user("LWS_CALLBACK_COMPLETED_CLIENT_HTTP %p\n", wsi);
+		lwsl_debug("LWS_CALLBACK_COMPLETED_CLIENT_HTTP %p\n", wsi);
 		return 0;
 
 	case LWS_CALLBACK_CLOSED_CLIENT_HTTP:
-		lwsl_user("LWS_CALLBACK_CLOSED_CLIENT_HTTP %p\n", wsi);
+		lwsl_notice("LWS_CALLBACK_CLOSED_CLIENT_HTTP %p\n", wsi);
 		req = (struct req *)user;
 		goto do_close;
 
@@ -334,6 +357,7 @@ nope:
 		close(req->fd);
 
 		req->fd = -1;
+		/* req will be freed when the wsi closes after this */
 	}
 
 	return -1;
@@ -347,15 +371,20 @@ do_close:
 	return 0;
 }
 
+#define LWS_PLUGIN_PROTOCOL_LWS_HPROXY \
+	{ \
+		"lws-hproxy", \
+		callback_hproxy, \
+		sizeof(struct pss_hproxy), \
+		4096, \
+		0, \
+		(void *)mention \
+	} \
+
+#if !defined (LWS_PLUGIN_STATIC)
+
 static const struct lws_protocols protocols[] = {
-	{
-		"lws-hproxy",
-		callback_hproxy,
-		sizeof(struct pss_hproxy),
-		4096,
-		0,
-		(void *)mention
-	},
+	LWS_PLUGIN_PROTOCOL_LWS_HPROXY
 };
 
 LWS_EXTERN LWS_VISIBLE int
@@ -381,3 +410,4 @@ destroy_protocol_hproxy(struct lws_context *context)
 {
 	return 0;
 }
+#endif
